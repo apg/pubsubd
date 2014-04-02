@@ -1,0 +1,25 @@
+#+Title: Pubsubd Readme
+
+* Pubsubd, a publish-subscribe system for Combosaurus
+
+Pubsubd was the second iteration of the pubsub system that we
+used, mostly, for cache invalidation in Combosaurus across the
+lot of services we had.
+
+The [original design](ORIGINAL.DESIGN.org), was considered to
+be ideal, but not practical, and I implemented a different 
+strategy. 
+
+Rather than the client exposing a server, the client essentially
+opened up a long lived TCP connection to pubsubd, gave it's 
+subscription id, and recieved MsgPack data representing published
+messages, or Pings.
+
+This was written in 2012.
+
+* Installation
+
+This code will *not* compile, as it is missing some important parts
+that are not open. However, it's the 2nd Go program I ever wrote,
+and I was quite happy with it. No idea how I'd rate it today. :)
+

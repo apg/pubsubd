@@ -1,0 +1,250 @@
+#+Title: A new PubSub
+
+*There's a horrible error in here, related to clients starting servers. A better solution is to simply stream from the server, and allow reconnects to pick up where they were by not garbage collecting failed connections until some time after*
+
+* Overview
+
+The PubSub system is a useful system for broadcasting events across the
+system. However, its current implementation has two flaws which could 
+negatively affect the health of the entire system as we start to rely on
+it to solve more problems. For one, it doesn't operate as a true PubSub
+system since it requires polling for new messages and two, it's 
+unreliable during network outages, as it removes the messages for each
+feed after =MAX_KEEP_TIME=. 
+
+The second point is the one which is most problematic when using PubSub
+to disseminate messages which instruct a service to update its in-memory
+storage based on external events that have occurred such as deletions,
+additions or updates.
+
+* Proposal for a more efficient/robust PubSub
+
+The current implementation of PubSubd uses a traditional client/server
+model. PubSubd listens for framed MessagePack RPC requests to publish
+messages, and listens for requests that allow a client to retrieve 
+messages.
+
+This model is based on a traditional post office, in which a user must
+go to the post office to check his mailbox, and must go to the post
+office to buy a stamp and send the letter. 
+
+The model which we'd like to see, is the letter-carrier model. A client
+still must go to the post office to *send* a message, but to receive
+messages, a letter carrier delivers them *directly* to the client, via
+a local mailbox. This frees the client of having to spend time to
+poll for messages on an interval, and reduces the latency for reacting
+to a received message.
+
+** Letter carrier model in PubSubd
+
+In order to implement the letter-carrier model with framed MessagePack
+RPC, each client that would like to participate in PubSubd will
+require an open port to receive messages on. Thus, each client will
+expose a server which speaks framed MessagePack RPC and responds to
+requests from the PubSubd to deliver messages to client-subscribed
+channels.
+
+*** Creation of server on the client
+
+It's important that PubSubd be able to communicate with multiple
+"clients" that reside on the same host, in the same way that a letter
+carrier must be able to distribute mail to multiple mailboxes within
+an apartment complex.
+
+To do this, a =register= call should be made. The result of this call
+returns a port which is within a range of XXLOW-XXHIGH unique to all
+clients residing on the same host. In other words, if a single host
+has 3 processes that are clients to PubSubd, 3 unique ports are
+required to be distributed. If a second host starts up 4 new clients,
+the same port numbers could be used for 3 of the 4 clients, since
+ports are unique to a *single* host, not globally. Thus, a client must
+be unique in (IP address, port), but not IP address *or* port.
+
+Once successfully registered, an attempt should be made to bind a
+framed MessagePack RPC server to the port given by =register=. If this
+fails, a second =register= call should be made citing the given port
+is not valid and a new port should be issued. This repeats until we
+have successfully created a server (e.g. mailbox) to listen for
+messages on. The port that was successfully registered should continue
+to be used for the life of the client's process, though a network
+outage may interrupt this, requiring a new port to be
+issued.[fn:reissue]
+
+The client's server should now be ready to respond to the following
+calls:
+
+**** =deliver(feed, message)=: Deliver a message
+**** =ping()=: Sent periodically by the server to ensure liveness
+**** =shutdown()=: Send a signal that the server is shutting down.
+
+If the client does not get a ping within some interval, it should be
+assumed that it has somehow become disconnected from the PubSubd,
+either due to a network failure, or some other "disaster." Recovery,
+from this state should result in an attempt to call =reconnect=, on
+the PubSubd, citing that the port is currently in use and messages can
+be delivered there.
+
+** The PubSubd server
+
+Tasked with the burden of delivering more messages, the PubSubd server
+obviously becomes more complicated. It must maintain state about
+active connections (e.g. active subscriptions, last message sent for
+given subscription, host/port to call back on), and actually determine
+which clients should get a newly published message, as well as store
+undelivered messages until such a time that all active clients have
+received them.
+
+More formally, the data stored for each active client (C) is as
+follows:
+
+*** =connection=: including the =host=, =issued port=
+*** =status=: including last contact, etc, for liveness, retries, etc.
+*** =subscriptions=: List of (feed-name, next-message-to-deliver) pairs
+
+It is important that the PubSubd server make its best effort to
+deliver messages even in the case of network failures. There should,
+however, be no guarantees that messages will arrive in sent order, or
+within some time after being sent, specifically because of the
+possibility for communication failure.
+
+In its best effort to deliver messages, the PubSubd server should use
+exponential backoff on failed delivery attempts, and on reconnects 
+and mark a client as dead only after some large threshold. A client
+that is marked dead can be harvested for its issued port, to be 
+reissued again.
+
+*** Feed/Message Storage
+
+In the current PubSubd, messages are stored in a bucket per feed. To
+serve a request, the bucket must be filtered to ensure duplicate
+messages aren't consumed and sorted by timestamp in order to preserve
+time ordering. Messages older than some constant =MAX_KEEP_TIME= are
+discarded in every call to =get_messages=.
+
+However, there is a more efficient model which can be used.
+
+Each feed can be stored as a singly-linked list with a pointer to its
+head and to its tail. New messages are appended to the back, and
+messages are delivered from the front. This implementation looks as if
+it is just a typical FIFO queue, but in fact there is something unique
+about our system. Every client may be receiving a different part of
+the queue! This also preserves time ordering and never requires a sort.
+
+It seems rather difficult to remove messages that are no longer in use
+from the queue, reclaiming the space they took, but in fact, there is
+a simple solution.
+
+In each message, we store a reference count, which is incremented when
+a subscriber (a client) is currently set to receive that message, and
+decremented when it moves on to the next message in the queue.
+
+Notice that messages starting at the head of the queue with a
+reference count of 0 are garbage and can simply be discarded. New
+subscriptions can take on the current head of the list as their
+starting pointer, which in most situations will be the first message
+with a non-0 reference count. Note however, that there is no issue
+with a new subscriber subscribing to the queue starting with a garbage
+message.
+
+*** RPC endpoints (i.e. calls)
+
+**** =publish(feed, message)=
+
+The =publish= end point publishes a message to a feed. Publish is
+=O(n)= on the number of active subscriptions. The reason for this is
+that subscriptions may be wildcarded, and the feed published to could
+match all =n= active subscriptions.
+
+**** =subscribe(port, feed)=
+
+=subscribe= takes a feed name, which is optionally wildcarded, which
+allows for a client to subscribe to multiple feeds simultaneously. The
+syntax for wildcards is simply an asterisk (*), which is equivalent
+to the regular expression =\..*=. Therefore, subscribing to the
+"feed" =foo.bar.*= will match all published messages that are
+published to feeds matching the regular expression =foo\.bar\..*=.
+
+**** =unsubscribe(port, feed)=
+
+The =unsubscribe= endpoint does as it says--it unsubscribes a client
+from receiving messages previously subscribed too. However,
+=unsubscribe= is a no-op if the exact string passed as the feed
+provided was not used to subscribe before it.  (e.g. when subscribed
+to =foo.bar.*=, one must unsubscribe with =foo.bar.*=)
+
+**** =register(port?, ack?)=
+
+=register= attempts to register client as someone who can subscribe to
+messages on port.  If port is not provided, one will be assigned
+(unique per host). If port is given and ack is set to false, a new
+unused port will be attempted. register(port, true) says, "Ok, I'm
+here."
+
+**** =reconnect(port)=
+
+Attempts to reestablish a possibly broken connection from host on
+port. This may or may not be successful depending on the state of
+pubsubd and elapsed time.
+
+*** Message Ordering
+
+Messages are delivered in FIFO order per feed. Thus, given 3 messages
+that arrive in rank order =M1=, =M2=, =M3=, and 2 feeds =F1=, =F2=. If
+=M2= is published to =F2=, and =M1= and =M3= to =F1=, =M3= is
+guaranteed to be delivered *after* =M1=, but =M2= may be delivered
+*before* =M1= *or* =M3=.
+
+*** Pings
+
+If there are no messages to be delivered to a client PubSubd makes a 
+call to the =ping= endpoint on the client. Success here, indicates that
+the client is still alive and listening, and failure here indicates 
+that we need to enter into recovery mode for the client in order to
+reestablish service.
+
+** Handling network failures/Recovery
+
+PubSubd must maintain a timestamp which indicates the last time it was
+able to successfully communicate with a client. This timestamp can
+represent either a successful ping, or a successful message delivery.
+It is important to note that successful publishes from the client are
+*not* included here because a successful publish doesn't mean the
+client can *receive* messages, nor does a successful publish have any
+way to determine *which* client initiated the publish.
+
+*** Delivery/Ping retry with exponential backoff
+
+If a connection is broken to a client, PubSubd will attempt to connect
+using exponential backoff. Thus, the first failure will try immediately
+to reconnect, the second will wait 2ms, the 3rd 4ms, 4th, 8ms and so on,
+until we reach some maximum threshold =MAX_RECONNECT_TIMEOUT=, at which
+point the client is marked dead, but remains in the clients list for
+some grace period in case the client issues a =reconnect= attempt. If a
+client initiates a =reconnect= attempt which is unsuccessful because the
+dead client was purged, the =reconnect= results in failure, which leaves
+the client to figure out how to recover. In some cases, it might be best
+for the client to exit and restart.
+
+If, however, the =reconnect= succeeds, the dead client is turned into a 
+live client and operation continues as normal. 
+
+
+* Conclusion
+
+The strategy proposed here allows for clients to do less work since they
+are not actively polling for new messages and instead are sitting back
+waiting for new messages. Since new messages are not being delivered
+constantly, the server will sit mostly idle. 
+
+Feeds are managed in constant time for most operations and log(n) only
+in the when a client is behind and the feed needs to be cleaned
+up. However, one could imagine a hybrid solution where the dead feed
+items are removed while the slow client is catching up. Using the
+naive algorithm outline above, we're still better off under the new
+strategy than the adhoc filter + sort required of the old method.
+
+
+--
+[fn:reissue] The reason for a second =register= is that the port may
+have been reassigned if the PubSubd server marked the failing client
+as dead.
